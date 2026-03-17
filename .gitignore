@@ -1,0 +1,71 @@
+# ── Python cache ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Build / packaging artifacts ──────────────────────────────────────────────
+dist/
+*.egg-info/
+.venv/
+
+# ── Session backups (working snapshots, not for distribution) ────────────────
+*.bak
+*.bak[0-9]
+*.bak[0-9][0-9]
+
+# ── Dated/numbered development snapshots ────────────────────────────────────
+blend_demo.*.py
+blend_demo_3d.py
+blend_lib.*.py
+conicspline.*.py
+demo_n_transitions.*.py
+
+# ── One-off probe / debug scripts ────────────────────────────────────────────
+probe_*.py
+debug_*.py
+check_conic_hermite_false.py
+check_nan_propagation.py
+
+# ── Old comparison and analysis scripts ─────────────────────────────────────
+compare_ch3.py
+compare_conic_hermite.py
+conic_fit.py
+
+# ── Old per-feature show / demo scripts (show_all_curves.py is kept) ─────────
+show_blend_j_trio.py
+show_dense_vs_sparse.py
+show_j8_zigzag.py
+show_kinks.py
+show_lissajous_n35.py
+show_shared_segment.py
+show_transitions.py
+show_vdp_kink.py
+show_zigzag_arc.py
+
+# ── Old demo / density / scan scripts ────────────────────────────────────────
+demo.py
+demo_density.py
+demo_extended_trange.py
+demo_monotonicity.py
+scan_lissajous.py
+scan_random_spline.py
+
+# ── Other session-specific utilities ─────────────────────────────────────────
+heredoc.py
+lissajous_zoom2.py
+find_better_sparse.py
+find_mixed_n.py
+find_spiral_orange.py
+plot_bad_blend.py
+plot_constraints.py
+transition_diagnostic.py
+transition_diagnostic.22.py
+
+# ── Generated output images ──────────────────────────────────────────────────
+*.png
+
+# ── Exported conversation transcripts ────────────────────────────────────────
+*.txt
+
+# ── Personal session notes ───────────────────────────────────────────────────
+btw_log.md

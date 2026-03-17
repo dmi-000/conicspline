@@ -1,0 +1,281 @@
+"""
+test_exact_conic.py — verify that for locally-conic data, adjacent windows
+produce consistent phi values at their shared knots, and that the blend is
+machine-epsilon accurate for purely conic input.
+
+With principal-frame orbit + vertex P₀ + physical sign convention:
+  - All windows on the same conic share the same physical principal-axis direction.
+  - phi_c = 0 automatically (B' = 0 in the principal frame).
+  - Vertex P₀ (L = 0) is intrinsic to the conic: same for all windows.
+  - Same frame + same P₀ + same phi_c → identical phi at every shared knot
+    → PCHIP derivatives at shared interior knots identical → blend exactly on conic.
+
+Tests:
+  1. Phi agreement at shared knots for a tilted ellipse arc (< 1e-10 spread).
+  2. Hyperbola (1 period) at n=8 has max algebraic residual < 1e-8
+     (ground truth IS the conic → machine-epsilon accuracy with vertex P₀).
+"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+import numpy as np
+import importlib.util
+
+_here = os.path.dirname(os.path.abspath(__file__))
+spec = importlib.util.spec_from_file_location('bd', os.path.join(_here, '..', 'blend_demo.py'))
+bd = importlib.util.module_from_spec(spec); spec.loader.exec_module(bd)
+from conicspline import fit_conic
+
+
+def _window_phi_values(pts, win_i):
+    """Compute phi values for window win_i using principal-frame + vertex P₀.
+
+    Mirrors _build_projective_arc_window exactly:
+      - Physical sign convention (first principal axis has positive x-component)
+      - Vertex P₀ where L = 0 (x_v = -D_e/(2*A_e))
+      - phi_c = 0 (B_p = 0 in principal frame)
+
+    Returns phi array of length 5, or None if vertex is degenerate.
+    """
+    p5 = pts[win_i : win_i + 5]
+    center = p5.mean(axis=0)
+    centered = p5 - center
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    e1, e2 = Vt[0], Vt[1]
+    pts_2d = np.column_stack([centered @ e1, centered @ e2])
+    coeffs = fit_conic(pts_2d)
+    A, B, C, D, E, F = coeffs
+
+    # Principal frame
+    M_pf = np.array([[A, B / 2.0], [B / 2.0, C]])
+    evals_pf, evecs_pf = np.linalg.eigh(M_pf)
+    idx = np.argsort(np.abs(evals_pf))
+    evals_pf, evecs_pf = evals_pf[idx], evecs_pf[:, idx]
+
+    # Physical sign convention: first principal axis has positive x-component in
+    # the global frame.  This makes the convention window-independent: e1 varies
+    # per window (SVD), but the physical eigenvector direction is fixed by the conic.
+    phys_x = float(evecs_pf[0, 0] * e1[0] + evecs_pf[1, 0] * e2[0])
+    phys_y = float(evecs_pf[0, 0] * e1[1] + evecs_pf[1, 0] * e2[1])
+    if phys_x < 0 or (abs(phys_x) < 1e-12 and phys_y < 0):
+        evecs_pf[:, 0] *= -1
+    if np.linalg.det(evecs_pf) < 0:
+        evecs_pf[:, 1] *= -1
+
+    A_p = float(evals_pf[0]);  C_p = float(evals_pf[1])
+    DE = np.array([D, E])
+    D_p = float(DE @ evecs_pf[:, 0]);  E_p = float(DE @ evecs_pf[:, 1])
+    pts_p = pts_2d @ evecs_pf
+
+    xs, ys = pts_p[:, 0].copy(), pts_p[:, 1].copy()
+    A_e, C_e, D_e, E_e = A_p, C_p, D_p, E_p
+    swapped = False
+
+    def _try_vertex(Ae, Ce, De, Ee, ys_loc):
+        if abs(Ae) < 1e-15:
+            return None
+        x_v = -De / (2.0 * Ae);  const_v = F - De ** 2 / (4.0 * Ae)
+        if abs(Ce) < 1e-15:
+            return None if abs(Ee) < 1e-15 else (x_v, -const_v / Ee)
+        disc = Ee ** 2 - 4.0 * Ce * const_v
+        if disc < 0:
+            return None
+        sq = np.sqrt(disc)
+        y1 = (-Ee + sq) / (2 * Ce);  y2 = (-Ee - sq) / (2 * Ce)
+        cy = float(np.mean(ys_loc))
+        return x_v, (y1 if abs(y1 - cy) <= abs(y2 - cy) else y2)
+
+    v_result = None
+    if abs(A_e) >= 1e-9 * max(abs(C_e), 1.0):
+        v_result = _try_vertex(A_e, C_e, D_e, E_e, ys)
+    if v_result is None:
+        A_e, C_e = C_e, A_e;  D_e, E_e = E_e, D_e;  xs, ys = ys, xs
+        swapped = True
+        if abs(A_e) >= 1e-9 * max(abs(C_e), 1.0):
+            v_result = _try_vertex(A_e, C_e, D_e, E_e, ys)
+
+    if v_result is None:
+        return None
+    x0, y0 = v_result
+    M_v = 2.0 * C_e * y0 + E_e
+    if abs(M_v) < 1e-15:
+        return None  # vertex at infinity / degenerate
+
+    dxi = xs - x0;  dyi = ys - y0
+    eps_dx = 1e-9 * (np.abs(dyi) + 1.0)
+    mask = np.abs(dxi) >= eps_dx
+    dxi_safe = np.where(mask, dxi, 1.0)
+    s = np.where(mask, dyi / dxi_safe, np.sign(dyi + 1e-300) * 1e15)
+    # At vertex: s0 = -L/M = 0 (since L = 0 by definition), so no s[k0] override
+    return np.unwrap(2.0 * np.arctan(s))   # phi_c = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def test_phi_agreement_at_shared_knots():
+    """Adjacent windows on the same ellipse arc agree on phi at shared inner knots.
+
+    With vertex P₀ + physical sign convention the phi values at shared physical
+    points should agree to machine precision (~1e-14).  We assert < 1e-10 to
+    leave a safe margin above floating-point rounding.
+    """
+    def ellipse(t):
+        a, b, theta = 3.0, 2.9, np.radians(37)
+        xe = a * np.cos(t);  ye = b * np.sin(t)
+        return (xe * np.cos(theta) - ye * np.sin(theta),
+                xe * np.sin(theta) + ye * np.cos(theta))
+
+    t_range = (0.2, 2.5)
+    n = 20
+    pts, times = bd.sample_curve(ellipse, t_range, n)
+
+    phi_at_knot = {}  # global knot index → list of phi values (one per window)
+
+    for win_i in range(n - 4):
+        phi = _window_phi_values(pts, win_i)
+        if phi is None:
+            continue
+        for local_j in range(5):
+            global_j = win_i + local_j
+            phi_at_knot.setdefault(global_j, []).append(phi[local_j])
+
+    max_phi_spread = 0.0
+    for gj, phi_list in phi_at_knot.items():
+        if len(phi_list) < 2:
+            continue
+        # Remove 2π offsets (unwrap is per-window; the overall offset may differ)
+        aligned = [phi_list[0]]
+        for pv in phi_list[1:]:
+            diff = pv - phi_list[0]
+            diff -= round(diff / (2 * np.pi)) * 2 * np.pi
+            aligned.append(phi_list[0] + diff)
+        spread = max(aligned) - min(aligned)
+        max_phi_spread = max(max_phi_spread, spread)
+
+    print(f"  max phi spread at shared knots: {max_phi_spread:.2e}")
+    assert max_phi_spread < 1e-10, \
+        f"Phi values disagree at shared knots: max spread = {max_phi_spread:.2e}"
+    print("  PASS  test_phi_agreement_at_shared_knots")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def test_hyperbola_machine_epsilon():
+    """Hyperbola (1 period) blend at n=8 has machine-epsilon algebraic residual.
+
+    The ground truth IS the conic x=sec(t), y=tan(t).  With vertex P₀ and
+    consistent sign convention, the blend lies exactly on the conic: every output
+    point satisfies x²−y²−1 ≈ 0 to near machine precision (~1e-12).
+    """
+    def hyp(t):
+        return 1.0 / np.cos(t), np.tan(t)
+    t_range = (-np.pi / 2 + 0.5, 3 * np.pi / 2 - 0.5)
+    n = 8
+
+    pts, times = bd.sample_curve(hyp, t_range, n)
+    _, _, _, wins, ms, me, methods = bd._run_blend(pts, times, False, 2)
+    output, _ = bd.blend_curve(pts, times, wins, ms, me, N_order=2, N_dense=100)
+
+    xs, ys = output[:, 0], output[:, 1]
+    # Analytic conic: x² − y² − 1 = 0  (standard hyperbola)
+    residuals = np.abs(xs ** 2 - ys ** 2 - 1.0)
+    max_res = float(np.max(residuals))
+    print(f"  Hyperbola n=8 max |x²−y²−1|: {max_res:.2e}")
+    print(f"  methods: {methods}")
+    assert max_res < 1e-8, \
+        f"Hyperbola residual too large: {max_res:.2e} (expected < 1e-8 for vertex P₀)"
+    print("  PASS  test_hyperbola_machine_epsilon")
+# ─────────────────────────────────────────────────────────────────────────────
+def test_circle_blend_accuracy():
+    """Unit circle arc blend: verifies accuracy and documents the exactness limit.
+
+    WHY circles ARE machine-epsilon exact (as of 2026-03-17):
+      - The near-circle path in _build_projective_arc_window uses the conic
+        center (cx, cy) — computed from the quadratic-form coefficients — as the
+        orbit origin instead of the stereographic vertex P₀.
+      - The center is intrinsic: all windows on the same circle compute the same
+        (cx, cy) to floating-point precision (~1e-12).
+      - phi = arctan2(y − cy, x − cx) is the global arc angle, which is linear
+        in the (uniformly-spaced) parameter → PCHIP interpolates it exactly.
+      - Same center + same phi → identical orbits from adjacent windows →
+        blend lies exactly on the circle.
+      - Degenerate eigenvalues are no longer an issue because the center (not the
+        principal-axis direction) drives the parameterisation.
+    """
+    def circle(t):
+        return np.cos(t), np.sin(t)
+    t_range = (0.2, 2.5)
+    n = 20
+
+    pts, times = bd.sample_curve(circle, t_range, n)
+    _, _, _, wins, ms, me, methods = bd._run_blend(pts, times, False, 2)
+    output, _ = bd.blend_curve(pts, times, wins, ms, me, N_order=2, N_dense=100)
+
+    xs, ys = output[:, 0], output[:, 1]
+    residuals = np.abs(xs ** 2 + ys ** 2 - 1.0)
+    max_res = float(np.max(residuals))
+    print(f"  Circle n=20 max |x²+y²-1|: {max_res:.2e}  (center-orbit: machine-eps exact)")
+    print(f"  methods: {set(methods)}")
+    assert max_res < 1e-10, \
+        f"Circle residual too large: {max_res:.2e} (regression: center orbit should be machine-eps exact)"
+    print("  PASS  test_circle_blend_accuracy")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def test_parabola_vertex_consistency():
+    """Parabola blend at the ellipse/hyperbola boundary: vertex P₀, not machine-eps.
+
+    The parabola y = t² lives at the degenerate boundary det = 4AC−B² = 0 between
+    ellipses and hyperbolas.  Key properties:
+
+    Architecture at the boundary:
+      - det = 0 → center (cx, cy) is undefined → center-orbit path is skipped.
+      - eval_sep sentinel = 1.0 (one eigenvalue is zero) → near-circle path also skipped.
+      - Both windows fall through to the vertex-P₀ (stereographic) path.
+
+    Why vertex P₀ is intrinsic for a parabola:
+      - Vertex at (0, 0) for y = x²: the point where L = 2Ax + D = 0 → x = 0.
+      - All windows on the same parabola compute the same vertex → phi values at
+        shared knots agree to machine precision → blend is consistent.
+
+    Why NOT machine-epsilon exact (unlike circle/hyperbola):
+      - Slopes from the vertex s_i = y_i/x_i = t_i are linear in t.
+      - phi = 2·arctan(s) = 2·arctan(t) is smooth but NONLINEAR → PCHIP introduces
+        O(h²) interpolation error between knots even though knot values are exact.
+      - Circle exactness relies on theta(t) being LINEAR (arc-length ∝ t for uniform
+        spacing).  Hyperbola: s = sin(t) is smooth, PCHIP error is ~1e-11 at n=8.
+        Parabola: s = t → phi = 2·arctan(t), similar but slightly more curved.
+
+    This test documents the achievable accuracy and confirms that 'conic' is used
+    (vertex path succeeds), not 'spline' (conic fit invalid).
+    """
+    def parabola(t):
+        return t, t ** 2
+
+    t_range = (-2.0, 2.0)
+    n = 20
+
+    pts, times = bd.sample_curve(parabola, t_range, n)
+    _, _, _, wins, ms, me, methods = bd._run_blend(pts, times, False, 2)
+    output, _ = bd.blend_curve(pts, times, wins, ms, me, N_order=2, N_dense=100)
+
+    xs, ys = output[:, 0], output[:, 1]
+    # Analytic conic: y − x² = 0  (standard upward parabola)
+    residuals = np.abs(ys - xs ** 2)
+    max_res = float(np.max(residuals))
+    print(f"  Parabola n=20 max |y−x²|: {max_res:.2e}  (vertex P₀, O(h²) — not machine-eps)")
+    print(f"  methods: {set(methods)}")
+    assert set(methods) == {'conic'}, \
+        f"Expected all-conic methods for parabola, got: {set(methods)}"
+    assert max_res < 1e-4, \
+        f"Parabola residual too large: {max_res:.2e} (expected < 1e-4 for vertex P₀ at n=20)"
+    print("  PASS  test_parabola_vertex_consistency")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    print("\nRunning test_exact_conic.py")
+    print("=" * 60)
+    test_phi_agreement_at_shared_knots()
+    test_hyperbola_machine_epsilon()
+    test_circle_blend_accuracy()
+    test_parabola_vertex_consistency()
+    print("=" * 60)
+    print("Done.\n")

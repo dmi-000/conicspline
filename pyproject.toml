@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conicspline"
+version = "0.1.0"
+description = "C^N-continuous parametric curve interpolation using conic arc sections"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "dmi", email = "0x771f@gmail.com" },
+    { name = "Claude (Anthropic)", email = "support@anthropic.com" },
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+]
+
+[project.urls]
+Repository = "https://github.com/dmi-000/conicspline"
+
+[tool.setuptools]
+py-modules = ["conicspline"]
