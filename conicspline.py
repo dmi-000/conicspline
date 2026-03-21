@@ -4,14 +4,14 @@ conicspline.py — C^N parametric curve interpolation.
 Fits conic arc sections wherever possible (spline fallback otherwise),
 using overlapping 5-point windows and a quintic smoothstep blend.
 
-When the input data lies exactly on a non-circular conic (ellipse with
-distinct semi-axes, hyperbola, parabola), the blend is exact everywhere
-between control points: both overlapping windows use the same conic vertex
-as their canonical base point — an intrinsic property of the conic,
-independent of which 5 points are sampled — producing identical orbit
-functions and an exact blend.  Circles are a degenerate case (equal
-eigenvalues); no globally consistent vertex direction can be extracted,
-so accuracy is spline-class rather than machine-epsilon.
+When the input data lies exactly on a conic, the blend is near
+machine-epsilon accurate everywhere between control points.  Each conic
+type uses its natural intrinsic parametrization: ellipses and circles use
+the eccentric-anomaly orbit anchored at the conic center (an algebraic
+invariant); hyperbolas use the stereographic orbit anchored at the conic
+vertex (also an algebraic invariant); parabolas use the vertex path with
+O(h²) accuracy.  Both overlapping windows on any segment share the same
+anchor → identical orbit functions → exact blend on the conic.
 
 Demo curves (CURVES list) and visualization live in blend_demo.py.
 """
@@ -19,6 +19,51 @@ Demo curves (CURVES list) and visualization live in blend_demo.py.
 import numpy as np
 from scipy.special import betainc
 from scipy.interpolate import CubicSpline, PchipInterpolator, CubicHermiteSpline, BPoly
+# ── Numerical thresholds ──────────────────────────────────────────────────────
+# Each constant serves a distinct semantic purpose; identical numeric values
+# are NOT interchangeable — do not consolidate.
+
+_EPS_GRAD      = 1e-30  # Gradient/normal norm below which the tangent direction
+                         # is undefined; guards divisions before normalisation.
+
+_EPS_CHORD     = 1e-15  # Minimum meaningful 1-D length: chord or arc-length gap
+                         # below which two samples are coincident or a window is
+                         # degenerate.  Used as a denominator floor for ratios.
+
+_EPS_COEFF     = 1e-15  # Conic coefficient (Ae, Ce, Ee, Me, Mk) treated as zero:
+                         # triggers coordinate swap, parabola branch, or
+                         # degenerate-conic short-circuit.  Same numeric value as
+                         # _EPS_CHORD but semantically distinct.
+
+_EPS_DET       = 1e-12  # |det(M)| = |4AC−B²| below which the conic is
+                         # near-parabolic and center computation is ill-conditioned;
+                         # also used for Q(s) asymptote proximity checks.
+
+_EPS_SWAP      = 1e-9   # Relative threshold for x↔y coordinate swap: swap when
+                         # |A_e| < _EPS_SWAP·max(|C_e|,1) or slope denominator
+                         # |dx| < _EPS_SWAP·(|dy|+1).
+
+_EPS_TSPAN     = 1e-9   # Relative parameter proximity: a sample at t is
+                         # "at control point tᵢ" when |t−tᵢ| < _EPS_TSPAN·span.
+                         # Same numeric value as _EPS_SWAP but semantically distinct.
+
+_EPS_CTRL      = 1e-3   # Orbit quality gate: maximum allowed distance from the
+                         # orbit to a control point.  Orbits exceeding this are
+                         # rejected and replaced by the arc-length / spline path.
+
+_EVAL_SEP_NEAR = 0.2    # Eigenvalue-separation threshold for "near-circle":
+                         # (|λ_max|−|λ_min|)/(|λ_max|+|λ_min|) < this value.
+                         # Load-bearing gate in _try_conic; the matching guard
+                         # inside _build_projective_arc_window is redundant
+                         # (computation optimisation only).
+
+_ALPHA_FALLBACK = 0.3   # Conic/spline disagreement ratio above which the
+                         # pure-spline window wins (≈ 22% of mean chord).
+
+_SIGN_NUG      = 1e-300 # Infinitesimal nudge before np.sign() so that
+                         # np.sign(0) = +1 rather than 0; also stabilises
+                         # eval-sep denominators against exact zero.
+
 # ── Conic fitting ─────────────────────────────────────────────────────────────
 # Inlined from orbitkit/conic_fit.py (local package, not on PyPI).
 
@@ -176,7 +221,7 @@ def _project_onto_conic(coeffs, x, y, niter=8):
         f = A*x**2 + B*x*y + C*y**2 + D*x + E*y + F
         g = _conic_gradient(coeffs, x, y)
         g2 = g[0]**2 + g[1]**2
-        if g2 < 1e-30:
+        if g2 < _EPS_GRAD:
             break
         x -= f * g[0] / g2
         y -= f * g[1] / g2
@@ -218,7 +263,7 @@ def _trace_conic_arc(coeffs, p0, p1, n_steps=100, initial_tang=None):
             g = _conic_gradient(coeffs, new[0], new[1])
             t2 = np.array([-g[1], g[0]])
             tn = np.linalg.norm(t2)
-            if tn > 1e-30:
+            if tn > _EPS_GRAD:
                 t2 /= tn
             if np.dot(t2, tang) < 0:
                 t2 = -t2
@@ -239,7 +284,7 @@ def _trace_conic_arc(coeffs, p0, p1, n_steps=100, initial_tang=None):
         g = _conic_gradient(coeffs, p1[0], p1[1])
         te = np.array([-g[1], g[0]])
         tn = np.linalg.norm(te)
-        if tn > 1e-30:
+        if tn > _EPS_GRAD:
             te /= tn
         if np.dot(te, tang_loop) < 0:
             te = -te
@@ -249,7 +294,7 @@ def _trace_conic_arc(coeffs, p0, p1, n_steps=100, initial_tang=None):
     g0 = _conic_gradient(coeffs, p0[0], p0[1])
     tang0 = np.array([-g0[1], g0[0]])
     tn = np.linalg.norm(tang0)
-    if tn > 1e-30:
+    if tn > _EPS_GRAD:
         tang0 /= tn
     if initial_tang is not None:
         if np.dot(tang0, initial_tang) < 0:
@@ -379,7 +424,7 @@ def _build_conic_tangent_spline(pts, ts, center3d, e1, e2, pts_2d, coeffs, n_der
         Gx = 2*A*lx_k + B*ly_k + D
         Gy = B*lx_k + 2*C*ly_k + E
         g  = np.sqrt(Gx**2 + Gy**2)
-        if g < 1e-30:
+        if g < _EPS_GRAD:
             continue
         tau = np.array([-Gy, Gx]) / g        # unit conic tangent
         # Sign reference: centered chord for interior knots, one-sided for ends.
@@ -401,7 +446,7 @@ def _build_conic_tangent_spline(pts, ts, center3d, e1, e2, pts_2d, coeffs, n_der
         else:
             chord = np.linalg.norm(pts_2d[k+1]-pts_2d[k-1])
             dt    = ts[k+1] - ts[k-1]
-        dydx_2d[k] = tau * (chord / dt if dt > 1e-30 else 1.0)
+        dydx_2d[k] = tau * (chord / dt if dt > _EPS_GRAD else 1.0)
 
     if n_deriv >= 2:
         # Analytical conic curvature: κ_vec = d²pos/ds² = -2·S2/g⁴ · (Gx,Gy)
@@ -413,7 +458,7 @@ def _build_conic_tangent_spline(pts, ts, center3d, e1, e2, pts_2d, coeffs, n_der
             Gx = 2*A*lx_k + B*ly_k + D
             Gy = B*lx_k + 2*C*ly_k + E
             g  = np.sqrt(Gx**2 + Gy**2)
-            if g < 1e-30:
+            if g < _EPS_GRAD:
                 continue
             S2 = A*Gy**2 - B*Gx*Gy + C*Gx**2
             kappa_vec = (-2*S2 / g**4) * np.array([Gx, Gy])  # d²pos/ds²
@@ -452,7 +497,7 @@ def _build_conic_tangent_spline(pts, ts, center3d, e1, e2, pts_2d, coeffs, n_der
                     ref_k = pts_2d[4] - pts_2d[3]
                 else:
                     ref_k = pts_2d[k + 1] - pts_2d[k - 1]
-                if np.linalg.norm(ref_k) > 1e-12 and float(trial[k] @ ref_k) < 0:
+                if np.linalg.norm(ref_k) > _EPS_DET and float(trial[k] @ ref_k) < 0:
                     continue   # flip would reverse forward direction — skip
                 dydx_2d[k] = -dydx_2d[k]
                 score = s2
@@ -521,7 +566,7 @@ def _blended_conic_spline(pts, ts, center3d, e1, e2, pts_2d, conic_func):
     # Scale by mean chord length between consecutive control points
     chord_lens = np.linalg.norm(np.diff(pts, axis=0), axis=1)
     mean_chord = np.mean(chord_lens)
-    if mean_chord < 1e-15:
+    if mean_chord < _EPS_CHORD:
         mean_chord = 1.0
 
     # Sigmoid-like transition:
@@ -533,9 +578,9 @@ def _blended_conic_spline(pts, ts, center3d, e1, e2, pts_2d, conic_func):
     # When the conic is significantly wrong anywhere in the window, the smoothed-α
     # approach leaves a residual conic contribution outside the α-peak region that
     # can corrupt the blend.  Guard: return pure spline immediately.
-    # Threshold 0.3 ≈ conic disagrees by ≥ 22% of mean chord anywhere in window.
-    # Good conic windows have max_alpha_raw ≈ 0; only problematic regions exceed 0.3.
-    if max_alpha_raw >= 0.3:
+    # _ALPHA_FALLBACK ≈ conic disagrees by ≥ 22% of mean chord anywhere in window.
+    # Good conic windows have max_alpha_raw ≈ 0; only problematic regions exceed it.
+    if max_alpha_raw >= _ALPHA_FALLBACK:
         pred = spline_func(ts)
         ctrl_err = np.max(np.linalg.norm(pred - pts, axis=1))
         return spline_func, ctrl_err, 'spline'
@@ -597,7 +642,7 @@ def _arc_sagitta(arc, p0, p1):
     """Max perpendicular distance of arc points from chord p0→p1."""
     chord = p1 - p0
     cl = np.linalg.norm(chord)
-    if cl < 1e-15:
+    if cl < _EPS_CHORD:
         return 0.0
     perp = np.array([-chord[1], chord[0]]) / cl
     return float(np.max(np.abs((arc - p0) @ perp)))
@@ -626,7 +671,7 @@ def _build_arc_interpolant(pts, ts, center3d, e1, e2, pts_2d,
     # s_ctrl data, eliminating the old binary monotonicity gate.
     s_of_t = PchipInterpolator(ts, s_ctrl)
 
-    unique_mask = np.diff(all_arc_s, prepend=-1) > 1e-15
+    unique_mask = np.diff(all_arc_s, prepend=-1) > _EPS_CHORD
     arc_s_unique = all_arc_s[unique_mask]
     arc_pts_unique = all_arc_pts[unique_mask]
 
@@ -672,7 +717,7 @@ def _build_arc_interpolant(pts, ts, center3d, e1, e2, pts_2d,
             Gx = 2*A*lx_k + B*ly_k + D
             Gy = B*lx_k + 2*C*ly_k + E
             g  = np.sqrt(Gx**2 + Gy**2)
-            if g < 1e-30:
+            if g < _EPS_GRAD:
                 continue  # degenerate gradient — keep zeros
             tau = np.array([-Gy, Gx]) / g
             # Sign: forward direction (toward next control pt, or from prev)
@@ -705,7 +750,7 @@ def _build_arc_interpolant(pts, ts, center3d, e1, e2, pts_2d,
                   _y_ds1(s)[:, None] * e2[None, :]) * dsd[:, None]
         if _ctrl_tang is not None:
             for i, ti in enumerate(t):
-                k_arr = np.where(np.abs(ts - ti) < _t_span * 1e-9)[0]
+                k_arr = np.where(np.abs(ts - ti) < _t_span * _EPS_TSPAN)[0]
                 if len(k_arr):
                     tau = _ctrl_tang[k_arr[0]]
                     result[i] = (tau[0]*e1 + tau[1]*e2) * dsd[i]
@@ -723,7 +768,7 @@ def _build_arc_interpolant(pts, ts, center3d, e1, e2, pts_2d,
         result = curv * (dsd**2)[:, None] + tang * d2sd[:, None]
         if _ctrl_curv is not None:
             for i, ti in enumerate(t):
-                k_arr = np.where(np.abs(ts - ti) < _t_span * 1e-9)[0]
+                k_arr = np.where(np.abs(ts - ti) < _t_span * _EPS_TSPAN)[0]
                 if len(k_arr):
                     k    = k_arr[0]
                     tau  = _ctrl_tang[k]
@@ -765,7 +810,7 @@ def _ray_conic_intersect(coeffs, focus, theta, r_hint=None):
     r1 = (-a1 + sq) / (2 * a2)
     r2 = (-a1 - sq) / (2 * a2)
 
-    roots = [r for r in [r1, r2] if r > 1e-15]
+    roots = [r for r in [r1, r2] if r > _EPS_CHORD]
     if not roots:
         return None
     if r_hint is not None and len(roots) > 1:
@@ -849,7 +894,7 @@ def _try_kepler_time(pts_2d, pts, ts, center3d, e1, e2, conic_coeffs):
             Gx = 2*A*x + B*y + D
             Gy = B*x + 2*C*y + E
             denom = Gx*ct + Gy*st
-            if abs(denom) < 1e-30:
+            if abs(denom) < _EPS_GRAD:
                 return 0.0, 0.0          # tangent point – treat as straight
             N  = Gx*st - Gy*ct
             rp = r * N / denom           # r'(θ)
@@ -952,8 +997,8 @@ def _try_kepler_time(pts_2d, pts, ts, center3d, e1, e2, conic_coeffs):
         # Near-collinear points (e.g. Lissajous crossing) produce extreme
         # conics that pass through the 5 control points but diverge wildly
         # in between — the chord-deviation ratio catches this.
-        max_ratio = np.max(mid_devs / np.maximum(chord_lens, 1e-15))
-        if max_ratio > 0.3:
+        max_ratio = np.max(mid_devs / np.maximum(chord_lens, _EPS_CHORD))
+        if max_ratio > _ALPHA_FALLBACK:
             continue
 
         if ctrl_err < best_err:
@@ -1026,7 +1071,7 @@ def _canonical_k0(xs, ys, A, B, C, D, E, candidates=None):
     """
     L  = 2.0*A*xs + B*ys + D
     M  = B*xs + 2.0*C*ys + E
-    Ms = np.where(np.abs(M) >= 1e-15, M, np.sign(M + 1e-300) * 1e-15)
+    Ms = np.where(np.abs(M) >= 1e-15, M, np.sign(M + _SIGN_NUG) * 1e-15)
     ratios = np.abs(L / Ms)
     if candidates is not None:
         k0 = candidates[int(np.argmin(ratios[candidates]))]
@@ -1056,7 +1101,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
     code path of _try_conic).  All evaluation is vectorised.
 
     Returns (orbit_func, ctrl_err, is_cross_branch) or None if:
-      - ctrl_err > 1e-3 (bad fit), or
+      - ctrl_err > _EPS_CTRL (bad fit), or
       - orbit_func produces NaN in the blend region (asymptote inside window).
     """
     A, B, C, D, E, F = coeffs
@@ -1118,7 +1163,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
     pts_p_raw = pts_2d @ evecs_pf
     phys_x = float(evecs_pf[0, 0] * e1[0] + evecs_pf[1, 0] * e2[0])
     phys_y = float(evecs_pf[0, 0] * e1[1] + evecs_pf[1, 0] * e2[1])
-    if phys_x < 0 or (abs(phys_x) < 1e-12 and phys_y < 0):
+    if phys_x < 0 or (abs(phys_x) < _EPS_DET and phys_y < 0):
         evecs_pf[:, 0] = -evecs_pf[:, 0]
         pts_p_raw[:, 0] = -pts_p_raw[:, 0]
     # Maintain right-hand orientation so the swap flag behaves consistently.
@@ -1157,7 +1202,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
     # compression at the tips of elongated ellipses; for circles (a=b), E
     # equals the central angle θ exactly.
     #
-    # Guard: eval_sep < 0.2 restricts the E orbit to near-circles.  This is a
+    # Guard: eval_sep < _EVAL_SEP_NEAR restricts the E orbit to near-circles.  This is a
     # COMPUTATION guard, not a correctness gate — for elongated same-branch
     # ellipses the E orbit would be discarded by _try_conic anyway (it falls
     # through to the arc-length quality check; only _near_circle windows get
@@ -1167,8 +1212,8 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
     abs_evals = np.abs(evals_pf)
     if (evals_pf[0] * evals_pf[-1] > 0                          # ellipse
             and (abs_evals[-1] - abs_evals[0])
-                / (abs_evals[-1] + abs_evals[0] + 1e-300) < 0.2):  # near-circular
-        if abs(A_p) > 1e-12 and abs(C_p) > 1e-12:
+                / (abs_evals[-1] + abs_evals[0] + _SIGN_NUG) < _EVAL_SEP_NEAR):  # near-circular
+        if abs(A_p) > _EPS_DET and abs(C_p) > _EPS_DET:
             cx_p  = -D_p / (2.0 * A_p)
             cy_p  = -E_p / (2.0 * C_p)
             Fc_p  = F - D_p**2 / (4.0 * A_p) - E_p**2 / (4.0 * C_p)
@@ -1218,7 +1263,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
                         orbit_func.d1 = _d1;  orbit_func.d2 = _d2
                         pred     = orbit_func(ts)
                         ctrl_err = float(np.nanmax(np.linalg.norm(pred - pts, axis=1)))
-                        if np.isfinite(ctrl_err) and ctrl_err <= 1e-3:
+                        if np.isfinite(ctrl_err) and ctrl_err <= _EPS_CTRL:
                             return orbit_func, ctrl_err, is_cross_branch
 
     # ── Principal-frame vertex P₀ path (general / fallback) ──────────────────
@@ -1231,12 +1276,12 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
 
     def _try_vertex(Ae, Ce, De, Ee, pts_loc):
         """Return (x_v, y_v) where L=0, or None if degenerate."""
-        if abs(Ae) < 1e-15:
+        if abs(Ae) < _EPS_COEFF:
             return None
         x_v = -De / (2.0 * Ae)
         const_v = F - De**2 / (4.0 * Ae)
-        if abs(Ce) < 1e-15:
-            if abs(Ee) < 1e-15:
+        if abs(Ce) < _EPS_COEFF:
+            if abs(Ee) < _EPS_COEFF:
                 return None
             y_v = -const_v / Ee
         else:
@@ -1253,21 +1298,21 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
     # Try vertex in current frame; swap x↔y if A_e too small (near-parabola).
     v_result = None
     _has_vertex = False
-    if abs(A_e) >= 1e-9 * max(abs(C_e), 1.0):
+    if abs(A_e) >= _EPS_SWAP * max(abs(C_e), 1.0):
         v_result = _try_vertex(A_e, C_e, D_e, E_e, pts_e)
     if v_result is None:
         A_e, C_e = C_e, A_e
         D_e, E_e = E_e, D_e
         pts_e = pts_e[:, ::-1]
         swapped = True
-        if abs(A_e) >= 1e-9 * max(abs(C_e), 1.0):
+        if abs(A_e) >= _EPS_SWAP * max(abs(C_e), 1.0):
             v_result = _try_vertex(A_e, C_e, D_e, E_e, pts_e)
 
     if v_result is not None:
         x0, y0 = v_result
         L_e = 0.0                        # vertex: L = 2A_e·x_v + D_e = 0
         M_e = 2.0 * C_e * y0 + E_e      # gradient M at vertex
-        if abs(M_e) >= 1e-15:
+        if abs(M_e) >= _EPS_COEFF:
             _has_vertex = True
 
     if not _has_vertex:
@@ -1277,16 +1322,16 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
                                           candidates=_INNER3)
         x0, y0 = pts_e[k0]
         L_e, M_e = L_all[k0], M_all[k0]
-        if abs(M_e) < 1e-15:
+        if abs(M_e) < _EPS_COEFF:
             return None            # still degenerate after swap
 
     s0 = -L_e / M_e   # = 0 for vertex (L_e=0), or tangent slope for fallback
     dxi = pts_e[:, 0] - x0
     dyi = pts_e[:, 1] - y0
-    eps_dx = 1e-9 * (np.abs(dyi) + 1.0)
+    eps_dx = _EPS_SWAP * (np.abs(dyi) + 1.0)
     mask = np.abs(dxi) >= eps_dx
     dxi_safe = np.where(mask, dxi, 1.0)
-    s_vals = np.where(mask, dyi / dxi_safe, np.sign(dyi + 1e-300) * 1e15)
+    s_vals = np.where(mask, dyi / dxi_safe, np.sign(dyi + _SIGN_NUG) * 1e15)
     if not _has_vertex:
         s_vals[k0] = s0   # exact tangent slope at argmin P₀ (vertex has no k0)
 
@@ -1324,10 +1369,10 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
             f0 = A*cx**2 + B*cx*cy + C*cy**2 + D*cx + E*cy + F
             # f0 ≈ 0 means the conic center lies on the conic itself — geometrically
             # impossible for a proper ellipse/hyperbola but numerically reachable.
-            # We could guard here (`if abs(f0) < 1e-15: return None`), but it is
+            # We could guard here (`if abs(f0) < _EPS_COEFF: return None`), but it is
             # unnecessary: ratio = −f0/a ≈ 0 → r = 0 → orbit collapses to the
             # center → ctrl_err = max distance from center to control points >>
-            # 1e-3 → return None below.  The downstream check does the right thing.
+            # _EPS_CTRL → return None below.  The downstream check does the right thing.
             theta_raw = np.arctan2(dy, dx)
             theta_u   = theta_raw.copy().astype(float)
             for i in range(4):
@@ -1341,7 +1386,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
                 overall_dir = float(np.sign(np.sum(same_diffs)))
                 if overall_dir == 0:
                     # Zero net theta direction: cross-branch correction is undefined.
-                    # We could let the orbit proceed, but ctrl_err >> 1e-3 would
+                    # We could let the orbit proceed, but ctrl_err >> _EPS_CTRL would
                     # catch the ambiguous result.  Returning early is cheaper.
                     return None
                 theta_u = theta_raw.copy().astype(float)
@@ -1361,7 +1406,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
                 th  = th_of_t(t)
                 ct, st = np.cos(th), np.sin(th)
                 a    = _Ab*ct**2 + _Bb*ct*st + _Cb*st**2
-                valid = np.abs(a) >= 1e-15
+                valid = np.abs(a) >= _EPS_COEFF
                 ratio = np.where(valid, -_f0 / a, np.nan)
                 r    = np.where(ratio > 0, np.sqrt(ratio), np.nan)
                 lx   = _cx + r * ct;  ly = _cy + r * st
@@ -1372,7 +1417,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
                 th  = th_of_t(t);  dth = _th_d1(t)
                 ct, st = np.cos(th), np.sin(th)
                 a    = _Ab*ct**2 + _Bb*ct*st + _Cb*st**2
-                valid = np.abs(a) >= 1e-15
+                valid = np.abs(a) >= _EPS_COEFF
                 a_s  = np.where(valid, a, 1.0)
                 ratio = np.where(valid, -_f0 / a_s, np.nan)
                 r    = np.where(ratio > 0, np.sqrt(ratio), np.nan)
@@ -1387,7 +1432,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
                 th   = th_of_t(t);  dth = _th_d1(t);  d2th = _th_d2(t)
                 ct, st = np.cos(th), np.sin(th)
                 a    = _Ab*ct**2 + _Bb*ct*st + _Cb*st**2
-                valid = np.abs(a) >= 1e-15
+                valid = np.abs(a) >= _EPS_COEFF
                 a_s  = np.where(valid, a, 1.0)
                 ratio = np.where(valid, -_f0 / a_s, np.nan)
                 r    = np.where(ratio > 0, np.sqrt(ratio), np.nan)
@@ -1408,7 +1453,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
             pred     = orbit_func(ts)
             # nanmax: NaN values (asymptote in blend region) → ctrl_err=inf → return None → spline fallback.
             ctrl_err = float(np.nanmax(np.linalg.norm(pred - pts, axis=1)))
-            if not np.isfinite(ctrl_err) or ctrl_err > 1e-3:
+            if not np.isfinite(ctrl_err) or ctrl_err > _EPS_CTRL:
                 return None
             return orbit_func, ctrl_err, True
 
@@ -1443,7 +1488,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
     def _xy_derivs(s_arr):
         """Return (x2d, y2d, dx/ds, dy/ds, d²x/ds², d²y/ds²) for array s_arr."""
         Q    = _A_e + _B * s_arr + _C_e * s_arr**2
-        valid = np.abs(Q) >= 1e-12
+        valid = np.abs(Q) >= _EPS_DET
         Q_s  = np.where(valid, Q, 1.0)
         u    = np.where(valid, -(_L_e + s_arr * _M_e) / Q_s, np.nan)
         x2d  = _x0 + u
@@ -1508,7 +1553,7 @@ def _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs):
     # NaN values (asymptote crossing) are excluded by nanmax.
     pred = orbit_func(ts)
     ctrl_err = float(np.nanmax(np.linalg.norm(pred - pts, axis=1)))
-    if not np.isfinite(ctrl_err) or ctrl_err > 1e-3:
+    if not np.isfinite(ctrl_err) or ctrl_err > _EPS_CTRL:
         return None
 
     return orbit_func, ctrl_err, is_cross_branch
@@ -1540,12 +1585,12 @@ def _try_conic(pts_2d, pts, ts, center3d, e1, e2, use_spline, N_order=2, coeffs=
 
     # ── Cross-branch: projective arc ──────────────────────────────────────────
     # Pre-filter: skip projective arc if φ = 2·arctan(s−s₀) is non-monotone.
-    # Exception: near-circles (eval_sep < 0.2, both eigenvalues same sign) use
+    # Exception: near-circles (eval_sep < _EVAL_SEP_NEAR, both eigenvalues same sign) use
     # an eccentric-anomaly orbit in _build_projective_arc_window rather than
     # stereographic phi, so stereographic monotonicity is irrelevant for them.
     # _near_circle is the load-bearing quality gate: it controls whether the
     # proj result gets an early return (bypassing the arc-length quality check)
-    # at line ~1570.  The matching eval_sep < 0.2 guard inside
+    # at line ~1570.  The matching eval_sep < _EVAL_SEP_NEAR guard inside
     # _build_projective_arc_window is redundant for correctness — it just saves
     # computing an E orbit that would otherwise be discarded here.
     _ev_raw = np.linalg.eigvalsh(np.array([[coeffs[0], coeffs[1]/2.0],
@@ -1553,7 +1598,7 @@ def _try_conic(pts_2d, pts, ts, center3d, e1, e2, use_spline, N_order=2, coeffs=
     _ev_abs = np.sort(np.abs(_ev_raw))
     _near_circle = (
         _ev_raw[0] * _ev_raw[-1] > 0
-        and (_ev_abs[-1] - _ev_abs[0]) / (_ev_abs[-1] + _ev_abs[0] + 1e-300) < 0.2
+        and (_ev_abs[-1] - _ev_abs[0]) / (_ev_abs[-1] + _ev_abs[0] + _SIGN_NUG) < _EVAL_SEP_NEAR
     )
     if _near_circle or _is_conic_monotone(pts_2d, coeffs=coeffs):
         proj = _build_projective_arc_window(pts_2d, pts, ts, center3d, e1, e2, coeffs)
@@ -1568,7 +1613,7 @@ def _try_conic(pts_2d, pts, ts, center3d, e1, e2, use_spline, N_order=2, coeffs=
             # control points.  adaptive_n_budget sees inf deviation and adds
             # more control points until the asymptote leaves the blend region.
             return proj_func, proj_err, 'conic'
-        if _near_circle and np.isfinite(proj_err) and proj_err <= 1e-3:
+        if _near_circle and np.isfinite(proj_err) and proj_err <= _EPS_CTRL:
             # Near-circle same-branch: eccentric-anomaly orbit is intrinsic
             # (same center and semi-axes for all windows on the same ellipse)
             # → machine-epsilon blend for exact-conic input.
@@ -1755,11 +1800,11 @@ def _is_conic_monotone(pts5_xy, coeffs=None):
         swapped = False
 
         def _try_v(Ae, Ce, De, Ee, ys_loc):
-            if abs(Ae) < 1e-15:
+            if abs(Ae) < _EPS_COEFF:
                 return None
             x_v = -De / (2.0 * Ae);  const_v = F - De**2 / (4.0 * Ae)
-            if abs(Ce) < 1e-15:
-                return None if abs(Ee) < 1e-15 else (x_v, -const_v / Ee)
+            if abs(Ce) < _EPS_COEFF:
+                return None if abs(Ee) < _EPS_COEFF else (x_v, -const_v / Ee)
             disc = Ee**2 - 4.0 * Ce * const_v
             if disc < 0:
                 return None
@@ -1769,34 +1814,34 @@ def _is_conic_monotone(pts5_xy, coeffs=None):
             return x_v, (y1 if abs(y1 - cy) <= abs(y2 - cy) else y2)
 
         v_result = None
-        if abs(A_e) >= 1e-9 * max(abs(C_e), 1.0):
+        if abs(A_e) >= _EPS_SWAP * max(abs(C_e), 1.0):
             v_result = _try_v(A_e, C_e, D_e, E_e, ys)
         if v_result is None:
             A_e, C_e = C_e, A_e;  D_e, E_e = E_e, D_e;  xs, ys = ys, xs
             swapped = True
-            if abs(A_e) >= 1e-9 * max(abs(C_e), 1.0):
+            if abs(A_e) >= _EPS_SWAP * max(abs(C_e), 1.0):
                 v_result = _try_v(A_e, C_e, D_e, E_e, ys)
 
         has_vertex = False
         if v_result is not None:
             x0, y0 = v_result
             M_v = 2.0 * C_e * y0 + E_e
-            if abs(M_v) >= 1e-15:
+            if abs(M_v) >= _EPS_COEFF:
                 has_vertex = True;  s0 = 0.0  # L=0 at vertex
 
         if not has_vertex:
             k0, L_all, M_all = _canonical_k0(xs, ys, A_e, 0.0, C_e, D_e, E_e,
                                               candidates=[1, 2, 3])
             L_e, M_e = L_all[k0], M_all[k0];  x0, y0 = xs[k0], ys[k0]
-            if abs(M_e) < 1e-15:
+            if abs(M_e) < _EPS_COEFF:
                 return False
             s0 = -L_e / M_e
 
         dxi = xs - x0;  dyi = ys - y0
-        eps_dx   = 1e-9 * (np.abs(dyi) + 1.0)
+        eps_dx   = _EPS_SWAP * (np.abs(dyi) + 1.0)
         mask     = np.abs(dxi) >= eps_dx
         dxi_safe = np.where(mask, dxi, 1.0)
-        s        = np.where(mask, dyi / dxi_safe, np.sign(dyi + 1e-300) * 1e15)
+        s        = np.where(mask, dyi / dxi_safe, np.sign(dyi + _SIGN_NUG) * 1e15)
         if not has_vertex:
             s[k0] = s0
         phi  = np.unwrap(2.0 * np.arctan(s))   # phi_c = 0 (B_p=0, vertex s0=0)
@@ -1817,9 +1862,9 @@ def _is_conic_monotone(pts5_xy, coeffs=None):
     _ev_nc_abs = np.sort(np.abs(_ev_nc))
     if (_ev_nc[0] * _ev_nc[-1] > 0
             and (_ev_nc_abs[-1] - _ev_nc_abs[0])
-                / (_ev_nc_abs[-1] + _ev_nc_abs[0] + 1e-300) < 0.2):
+                / (_ev_nc_abs[-1] + _ev_nc_abs[0] + _SIGN_NUG) < _EVAL_SEP_NEAR):
         det_nc = 4.0*A*C - B*B
-        if abs(det_nc) > 1e-12:
+        if abs(det_nc) > _EPS_DET:
             cx_nc = (B*E - 2*C*D) / det_nc;  cy_nc = (B*D - 2*A*E) / det_nc
             th_nc = np.arctan2(pts5_xy[:, 1] - cy_nc, pts5_xy[:, 0] - cx_nc)
             th_nc = np.unwrap(th_nc)
@@ -1858,13 +1903,13 @@ def _is_conic_monotone(pts5_xy, coeffs=None):
     # of both windows covering each blend segment — matches _build_projective_arc_window.
     Lk    = 2.0 * A_r * xs_r + D_r
     Mk    = 2.0 * C_r * ys_r + E_r
-    ratio = np.where(np.abs(Mk) > 1e-15, np.abs(Lk) / np.abs(Mk), 1e30)
+    ratio = np.where(np.abs(Mk) > _EPS_COEFF, np.abs(Lk) / np.abs(Mk), 1e30)
     k0    = [1, 2, 3][int(np.argmin(ratio[[1, 2, 3]]))]
     x0, y0 = xs_r[k0], ys_r[k0]
     L, M  = Lk[k0], Mk[k0]
 
     # ── x'↔y' swap if tangent at P₀ is nearly vertical in principal frame ────
-    if abs(M) < 1e-9 * max(abs(L), 1.0):
+    if abs(M) < _EPS_SWAP * max(abs(L), 1.0):
         A_r, C_r = C_r, A_r
         D_r, E_r = E_r, D_r
         xs_r, ys_r = ys_r, xs_r
@@ -1872,7 +1917,7 @@ def _is_conic_monotone(pts5_xy, coeffs=None):
         L = 2.0 * A_r * x0 + D_r
         M = 2.0 * C_r * y0 + E_r
 
-    if abs(M) < 1e-15:
+    if abs(M) < _EPS_COEFF:
         return False                        # degenerate even after swap
 
     s0 = -L / M
@@ -1880,10 +1925,10 @@ def _is_conic_monotone(pts5_xy, coeffs=None):
     # ── Stereographic slopes in parameter order ────────────────────────────────
     dxi      = xs_r - x0
     dyi      = ys_r - y0
-    eps_dx   = 1e-9 * (np.abs(dyi) + 1.0)
+    eps_dx   = _EPS_SWAP * (np.abs(dyi) + 1.0)
     mask     = np.abs(dxi) >= eps_dx
     dxi_safe = np.where(mask, dxi, 1.0)
-    s        = np.where(mask, dyi / dxi_safe, np.sign(dyi + 1e-300) * 1e15)
+    s        = np.where(mask, dyi / dxi_safe, np.sign(dyi + _SIGN_NUG) * 1e15)
     s[k0]    = s0                           # replace self-slope with tangent
 
     # Q(s) = A' + C'·s²   (B'=0 by construction)
@@ -2006,7 +2051,7 @@ def _make_conic_clamped_spline(j, pts, times):
             Gx = 2*A*lx + B*ly + D
             Gy = B*lx + 2*C*ly + E
             g = np.sqrt(Gx*Gx + Gy*Gy)
-            if g < 1e-30:
+            if g < _EPS_GRAD:
                 return None
             tau = np.array([-Gy, Gx]) / g        # unit conic tangent (local)
             ref = p5_2d[chord_b] - p5_2d[chord_a]  # chord reference (local)
@@ -2014,7 +2059,7 @@ def _make_conic_clamped_spline(j, pts, times):
                 tau = -tau
             chord_len = np.linalg.norm(ref)
             dt_chord  = abs(t_b - t_a)
-            speed = chord_len / dt_chord if dt_chord > 1e-30 else 1.0
+            speed = chord_len / dt_chord if dt_chord > _EPS_GRAD else 1.0
             tau_scaled = tau * speed              # velocity in local SVD coords
             return tau_scaled[0]*e1[:2] + tau_scaled[1]*e2[:2]   # world XY
         except Exception:
@@ -2098,7 +2143,7 @@ def _conic_distance(coeffs, x, y):
     gx = 2*A*x + B*y + D
     gy = B*x + 2*C*y + E
     gnorm = np.sqrt(gx**2 + gy**2)
-    if gnorm > 1e-30:
+    if gnorm > _EPS_GRAD:
         return np.abs(fval) / gnorm
     return np.abs(fval)
 
