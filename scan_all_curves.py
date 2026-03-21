@@ -30,6 +30,10 @@ _EXTRA_CURVES = [
 # Metric: max(||blended − truth||) * Menger_kappa (curvature-scaled, ≈ radians angular error).
 # Threshold 0.018 ≈ δ·κ at old Euclidean-0.01 baseline for Random spline (n=28, δ·κ=0.01777).
 # Update after any intentional change to conicspline or the CURVES list.
+#
+# Van der Pol uses speed-adaptive sampling (sample_curve_speed, alpha=1.0):
+#   density ∝ phase-space speed + 1 baseline → 57 points vs 128 uniform (55% reduction).
+#   Uniform baseline is n=128; speed-adaptive achieves the same max_dev target with n=57.
 BASELINES = {
     'Logarithmic spiral':  7,
     'Lissajous (3:2)':    38,
@@ -38,16 +42,22 @@ BASELINES = {
     '5-petal flower':     28,
     'Kepler + drift':      7,
     'Random spline':      21,
-    'Van der Pol (mu=3)': 128,
+    'Van der Pol (mu=3)': 57,
     'Hyperbola (1 period)':  8,
+}
+
+# Per-curve sampler overrides: use speed-adaptive for Van der Pol.
+_CURVE_SAMPLERS = {
+    'Van der Pol (mu=3)': bd.sample_curve_speed,
 }
 
 print(f"{'Curve':26s}  {'n':>4}  {'max_dev':>10}  {'baseline':>8}  methods")
 print("-" * 80)
 failures = []
 for title, xy_func, t_range in list(bd.CURVES) + _EXTRA_CURVES:
-    n = bd.adaptive_n_budget(xy_func, t_range)
-    pts, times = bd.sample_curve(xy_func, t_range, n)
+    sampler = _CURVE_SAMPLERS.get(title)
+    n = bd.adaptive_n_budget(xy_func, t_range, sampler=sampler)
+    pts, times = (sampler or bd.sample_curve)(xy_func, t_range, n)
     _, _, _, wins, ms, me, methods = bd._run_blend(pts, times, False, 2)
     wj, md, _ = bd._find_worst_interval(
         pts, times, wins, ms, me, xy_func, t_range, 2)

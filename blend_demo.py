@@ -61,17 +61,54 @@ def _find_worst_interval(pts, times, windows, middle_start, middle_end,
     return worst_j, max(devs), devs
 
 
+def sample_curve_speed(xy_func, t_range, n, alpha=1.0, n_dense=2000):
+    """Sample n control points with density proportional to phase-space speed^alpha + 1.
+
+    Concentrates points where the parametric curve moves fastest (high curvature
+    transitions, spikes).  The +1 baseline prevents flat regions from being starved.
+
+    alpha=0  → uniform (same as sample_curve)
+    alpha=1  → density proportional to speed  (arc-length-ish, default)
+
+    Useful for stiff curves like Van der Pol (mu=3) where the spike region accounts
+    for most of the approximation error.  Reduces VdP n from 128 → 57 at the
+    default max_dev_target=0.018.  Has no effect on easy curves (Spiral, Kepler)
+    and degrades Damped oscillation, so use only for curves with genuine speed spikes.
+    """
+    t_dense = np.linspace(t_range[0], t_range[1], n_dense)
+    x, y = xy_func(t_dense)
+    dx = np.gradient(x, t_dense)
+    dy = np.gradient(y, t_dense)
+    speed = np.sqrt(dx**2 + dy**2) + 1e-15
+    speed_mean = np.mean(speed) + 1e-15
+    density = (speed / speed_mean) ** alpha + 1.0
+    cdf = np.cumsum(density)
+    cdf = (cdf - cdf[0]) / (cdf[-1] - cdf[0])
+    tau = np.linspace(0.0, 1.0, n)
+    t_sampled = np.interp(tau, cdf, t_dense)
+    x_s, y_s = xy_func(t_sampled)
+    pts   = np.column_stack([x_s, y_s, np.zeros(n)])
+    times = (t_sampled - t_range[0]) / (t_range[1] - t_range[0])
+    return pts, times
+
+
 def adaptive_n_budget(xy_func, t_range, max_dev_target=0.018, N_order=2,
-                      n_min=7, n_max=500):
+                      n_min=7, n_max=500, sampler=None):
     """Find minimum n such that blended interpolation max_dev ≤ target.
 
     Uses exponential search (doubling) then linear scan within the bracket.
     O(log n_converge) evaluations vs O(n_converge) for plain linear scan.
+
+    sampler: callable (xy_func, t_range, n) -> (pts, times).  Defaults to
+             sample_curve (uniform spacing).  Pass sample_curve_speed for
+             speed-adaptive spacing (recommended for Van der Pol).
     """
+    if sampler is None:
+        sampler = sample_curve
     cache = {}
     def eval_cached(n):
         if n not in cache:
-            pts, times = sample_curve(xy_func, t_range, n)
+            pts, times = sampler(xy_func, t_range, n)
             _, _, _, wins, ms, me, _ = _run_blend(
                 pts, times, use_spline=False, N_order=N_order)
             _, md, _ = _find_worst_interval(
