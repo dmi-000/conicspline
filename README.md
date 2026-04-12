@@ -12,6 +12,37 @@ Where the data lies exactly on a conic, the blend is near machine-epsilon accura
 
 For general smooth curves that are only locally conic, accuracy improves with the number of control points. A natural cubic spline window is used as a fallback where the conic fit is geometrically invalid.
 
+---
+
+## Successor: arcspline
+
+[**arcspline**](https://github.com/dmi-000/arcspline) is the C++ successor to
+`conicspline`.  It generalises the same overlapping-window + smoothstep-blend
+architecture to higher-dimensional geometric primitives:
+
+| Feature | conicspline | arcspline |
+|---|---|---|
+| Language | Python (NumPy/SciPy) | Header-only C++17 |
+| Dimensions | 2D / 3D via projection | ℝᴺ, any N ≥ 2 |
+| 2D window | Conic arc (SVD fit) | Conic arc (`ConicWindow<2>`) |
+| 3D window | Conic arc (projects to 2D) | Cylinder geodesic (`CylinderWindow<3>`) |
+| 4D+ window | — | Clifford torus (`CliffordWindow<N>`) |
+| Fallback | Cubic spline | Lagrange or Floater-Hormann rational |
+| Blend style | Continuous α(t) conic/spline mix | Binary gate + geometric hierarchy |
+
+**When to use conicspline:** Python environment; 2D curves; the continuous
+conic/spline disagreement blend is useful for "almost-conic" data where neither
+a pure conic nor a pure spline is ideal.
+
+**When to use arcspline:** C++ environment; 3D/4D/ND curves (helices, Clifford
+tori); exact cylindrical or Clifford fits are needed; no external dependencies.
+
+The core algorithm — 5-point algebraic conic fit, vertex-P₀ + φ = 2·arctan(s)
+orbit, overlapping windows blended with a smoothstep weight — is shared by both
+libraries and originated in `conicspline`.
+
+---
+
 ## Install
 
 ```bash
